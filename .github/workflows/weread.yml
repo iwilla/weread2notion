@@ -7,6 +7,18 @@ on:
         description: "只补齐书籍属性，保留笔记正文"
         type: boolean
         default: false
+      dry-run:
+        description: "仅预览，不写入 Notion（首次升级建议勾选）"
+        type: boolean
+        default: true
+      full-refresh:
+        description: "全面核对笔记并刷新静态属性（不删除页面）"
+        type: boolean
+        default: false
+      book-id:
+        description: "仅处理指定 BookId，留空处理全部笔记本"
+        type: string
+        required: false
   schedule:
     - cron: "0 0 * * *"
 
@@ -25,6 +37,9 @@ jobs:
         uses: ./
         with:
           properties-only: ${{ inputs.properties-only || false }}
+          dry-run: ${{ inputs.dry-run || false }}
+          full-refresh: ${{ inputs.full-refresh || false }}
+          book-id: ${{ inputs.book-id }}
           weread-api-key: ${{ secrets.WEREAD_API_KEY }}
           notion-token: ${{ secrets.NOTION_TOKEN }}
           notion-page: ${{ secrets.NOTION_PAGE }}

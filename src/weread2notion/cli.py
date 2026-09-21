@@ -9,7 +9,11 @@ from datetime import datetime, timezone
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
-from retrying import retry
+from .incremental import (
+    NotionStore, source_records, find_area, ensure_area, reconcile,
+    clean_body, marker, property_changes, property_value,
+)
+from collections import Counter
 from .blocks import (
     get_callout,
     get_date,
@@ -66,6 +70,10 @@ def resolve_property_name(name):
 
 
 class ConfigError(Exception):
+    pass
+
+
+class UpgradeRequired(RuntimeError):
     pass
 
 
@@ -158,21 +166,27 @@ class WeReadGatewayClient:
             }
         )
 
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
     def request(self, api_name, **kwargs):
-        payload = {
-            "api_name": api_name,
-            "skill_version": WEREAD_SKILL_VERSION,
-            **kwargs,
-        }
-        response = self.session.post(WEREAD_GATEWAY_URL, json=payload, timeout=30)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("upgrade_info"):
-            raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
-        if data.get("errcode", 0) != 0:
-            raise Exception(f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}")
-        return data
+        payload = {"api_name": api_name, "skill_version": WEREAD_SKILL_VERSION, **kwargs}
+        for attempt in range(4):
+            try:
+                response = self.session.post(WEREAD_GATEWAY_URL, json=payload, timeout=30)
+                response.raise_for_status()
+                data = response.json()
+                if data.get("upgrade_info"):
+                    raise UpgradeRequired("微信读书接口要求升级 skill_version，请更新程序后重试")
+                if data.get("errcode", 0) != 0:
+                    raise RuntimeError(f"微信读书请求失败: {api_name}, errcode={data.get('errcode')}")
+                return data
+            except requests.HTTPError:
+                if response.status_code != 429 and response.status_code < 500:
+                    raise
+                if attempt == 3:
+                    raise
+            except (requests.Timeout, requests.ConnectionError):
+                if attempt == 3:
+                    raise
+            time.sleep(2 ** attempt)
 
 
 def get_range_start(item):
@@ -196,7 +210,6 @@ def get_note_sort_key(item, chapter=None):
     return (chapter_idx, get_range_start(item))
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookmark_list(bookId):
     """获取我的划线"""
     data = weread.request("/book/bookmarklist", bookId=bookId)
@@ -204,11 +217,12 @@ def get_bookmark_list(bookId):
     return sorted(updated, key=get_note_sort_key)
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_read_info(bookId):
     data = weread.request("/book/getprogress", bookId=bookId)
-    book = data.get("book") or {}
-    progress = to_number(book.get("progress")) or 0
+    book = data.get("book")
+    if not isinstance(book, dict) or to_number(book.get("progress")) is None:
+        raise RuntimeError("微信读书阅读进度响应不完整，保留已有阅读信息")
+    progress = to_number(book["progress"])
     reading_progress = normalize_reading_progress(progress)
     finish_time = book.get("finishTime") or 0
     update_time = book.get("updateTime") or 0
@@ -228,9 +242,8 @@ def get_read_info(bookId):
 
 def normalize_reading_progress(value):
     value = to_number(value) or 0
-    if value > 1:
-        value = value / 100
-    return round(min(max(value, 0), 1), 4)
+    # Gateway progress is always 0..100; 1 means one percent.
+    return round(min(max(value / 100, 0), 1), 4)
 
 
 def normalize_rating(value):
@@ -242,16 +255,14 @@ def normalize_rating(value):
     return value
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_bookinfo(bookId):
     """获取书的详情"""
     data = weread.request("/book/info", bookId=bookId)
-    isbn = data.get("isbn", "")
-    newRating = normalize_rating(data.get("newRating"))
+    isbn = data.get("isbn")
+    newRating = normalize_rating(data["newRating"]) if data.get("newRating") is not None else None
     return (isbn, newRating)
 
 
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_review_list(bookId):
     """获取笔记"""
     reviews_data = []
@@ -281,18 +292,6 @@ def get_review_list(bookId):
     return summary, reviews
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
-    filter = build_equals_filter("BookId", bookId)
-    response = query_data_source(filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
-
-
-@retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_chapter_info(bookId):
     """获取章节信息"""
     data = weread.request("/book/chapterinfo", bookId=bookId)
@@ -337,19 +336,27 @@ def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
     return build_notion_properties(raw_properties)
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
+def create_book_page(properties, cover):
+    """Create a stable page without advancing the note synchronization cursor."""
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"type": "data_source_id", "data_source_id": data_source_id}
-    properties = book_properties(
-        bookName, bookId, sort, author, isbn, rating, categories
-    )
+    properties = {name: value for name, value in properties.items() if name != "Sort"}
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
+    response = client.pages.create(
+        parent={"type": "data_source_id", "data_source_id": data_source_id},
+        icon=icon, cover=icon, properties=properties,
+    )
+    return response["id"]
+
+
+def list_page_blocks(page_id):
+    params = {"block_id": page_id, "page_size": 100}
+    while True:
+        response = client.blocks.children.list(**params)
+        yield from response.get("results", [])
+        if not response.get("has_more"):
+            return
+        params["start_cursor"] = response["next_cursor"]
 
 
 def add_children(id, children):
@@ -360,14 +367,18 @@ def add_children(id, children):
             block_id=id, children=children[i : i + 100]
         )
         results.extend(response.get("results"))
-    return results if len(results) == len(children) else None
+    if len(results) != len(children):
+        raise RuntimeError("Notion 返回的笔记块数量不完整，请重新运行同步")
+    return results
 
 
 def add_grandchild(grandchild, results):
     for key, value in grandchild.items():
         time.sleep(0.3)
         id = results[key].get("id")
-        client.blocks.children.append(block_id=id, children=[value])
+        response = client.blocks.children.append(block_id=id, children=[value])
+        if len(response.get("results", [])) != 1:
+            raise RuntimeError("Notion 返回的批注块数量不完整，请重新运行同步")
 
 
 def get_notebooklist():
@@ -375,18 +386,24 @@ def get_notebooklist():
     books = []
     hasMore = 1
     lastSort = None
+    seen_sorts = set()
     while hasMore:
         params = {"count": 100}
         if lastSort is not None:
             params["lastSort"] = lastSort
         data = weread.request("/user/notebooks", **params)
         hasMore = data.get("hasMore", 0)
-        batch = data.get("books") or []
+        if not isinstance(data.get("books"), list):
+            raise RuntimeError("微信读书笔记本响应不完整")
+        batch = data["books"]
         books.extend(batch)
         if batch:
             lastSort = batch[-1].get("sort")
-        else:
-            hasMore = 0
+            if hasMore and (lastSort is None or lastSort in seen_sorts):
+                raise RuntimeError("微信读书笔记本分页游标未前进")
+            seen_sorts.add(lastSort)
+        elif hasMore:
+            raise RuntimeError("微信读书笔记本分页返回空页")
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
 
@@ -817,80 +834,176 @@ def resolve_data_source_id(notion_id):
     return sources[0]["id"]
 
 
-def sync(properties_only=False):
+def load_page_index(store):
+    index = {}
+    body = {"page_size": 100}
+    seen = set()
+    while True:
+        response = store.request(f"data_sources/{data_source_id}/query", "POST", body)
+        for page in response.get("results", []):
+            book_id = property_value(page.get("properties", {}).get("BookId", {}))
+            if book_id is not None and str(book_id):
+                index.setdefault(str(book_id), []).append(page)
+        if not response.get("has_more"):
+            return index
+        cursor = response.get("next_cursor")
+        if not cursor or cursor in seen:
+            raise RuntimeError("Notion 书籍分页游标未前进")
+        seen.add(cursor)
+        body["start_cursor"] = cursor
+
+
+def get_note_records(book_id):
+    data = weread.request("/book/bookmarklist", bookId=book_id)
+    if not isinstance(data.get("updated"), list):
+        raise RuntimeError("微信读书划线响应不完整，未推进同步进度")
+    chapters_by_id = {str(key): value for key, value in get_chapter_info(book_id).items()}
+    for chapter in data.get("chapters") or []:
+        key = str(chapter["chapterUid"])
+        chapters_by_id[key] = {**chapters_by_id.get(key, {}), **chapter}
+    chapters = list(chapters_by_id.values())
+    reviews = []
+    cursor = 0
+    seen = set()
+    while True:
+        response = weread.request("/review/list/mine", bookid=book_id, synckey=cursor, count=100)
+        if not isinstance(response.get("reviews"), list):
+            raise RuntimeError("微信读书想法响应不完整，未推进同步进度")
+        reviews.extend(response["reviews"])
+        if not response.get("hasMore"):
+            break
+        next_cursor = response.get("synckey")
+        if next_cursor is None or next_cursor == cursor or str(next_cursor) in seen:
+            raise RuntimeError("微信读书想法分页游标未前进")
+        seen.add(str(next_cursor))
+        cursor = next_cursor
+    url = f"{WEREAD_URL}web/reader/{calculate_book_str_id(book_id)}"
+    records = source_records(book_id, data["updated"], reviews, chapters, url)
+    # Only explicit deletions are trusted. Absence from a response isn't deletion.
+    removed = []
+    for item in data.get("removed") or []:
+        identifier = item.get("bookmarkId") if isinstance(item, dict) else item
+        if identifier is not None:
+            removed.append(f"bookmark:{identifier}")
+    return records, removed
+
+
+def notebook_cursor(item):
+    return {key: item.get(key) for key in ("sort", "noteCount", "reviewCount", "bookmarkCount")}
+
+
+def sync(properties_only=False, dry_run=False, full_refresh=False, book_id=None):
     global client, data_source_id, weread
     secrets = validate_secret_inputs()
-    notion_id = extract_notion_id()
-    notion_token = secrets["notion_token"]
     weread = WeReadGatewayClient(secrets["weread_api_key"])
-    client = Client(
-        auth=notion_token,
-        log_level=logging.ERROR,
-        notion_version=NOTION_VERSION,
-    )
-    data_source_id = resolve_data_source_id(notion_id)
-    print(f"Notion API Version: {NOTION_VERSION}")
-    print(f"Notion Data Source ID: {data_source_id}")
+    # Disable SDK write retries: after a timeout reconcile identities first.
+    client = Client(auth=secrets["notion_token"], log_level=logging.ERROR,
+                    notion_version=NOTION_VERSION, retry=False)
+    store = NotionStore(client, dry_run=dry_run)
+    data_source_id = resolve_data_source_id(extract_notion_id())
     load_data_source_schema()
-    refreshed = 0
-    synced = 0
-    skipped = 0
-    books = get_notebooklist()
-    if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
-            book = book.get("book") or book
-            title = book.get("title") or ""
-            cover = (book.get("cover") or "").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            author = book.get("author") or ""
-            if not bookId:
+    pages_by_book = load_page_index(store)
+    books = get_notebooklist() or []
+    totals = Counter()
+    failures = []
+    matched = False
+    for item in books:
+        book = {**item, **(item.get("book") or {})}
+        identifier = str(book.get("bookId") or "")
+        if not identifier or (book_id and identifier != book_id):
+            continue
+        matched = True
+        title = book.get("title") or identifier
+        try:
+            pages = pages_by_book.get(identifier, [])
+            if len(pages) > 1:
+                raise RuntimeError("BookId 对应多个页面，请人工确认；未修改任何副本")
+            page = pages[0] if pages else None
+            if properties_only and not page:
+                totals["skipped_books"] += 1
                 continue
+            existing = (page or {}).get("properties", {})
+            missing_details = any(
+                get_property_type(name) and property_value(existing.get(resolve_property_name(name), {})) in (None, "")
+                for name in ("ISBN", "评分")
+            )
+            isbn, rating = (get_bookinfo(identifier) if (missing_details or full_refresh)
+                            and has_any_property(("ISBN", "评分")) else (None, None))
             categories = book.get("categories")
-            if categories != None:
+            if categories is not None:
                 categories = [x["title"] for x in categories]
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            pages = find_book_pages(bookId)
-            if properties_only and not pages:
-                skipped += 1
+            desired = book_properties(title, identifier, item.get("sort") or 0,
+                                      book.get("author"), isbn, rating, categories)
+            desired.pop("Sort", None)
+            changes = property_changes(existing, desired)
+            if not page:
+                totals["new_pages"] += 1
+                if not dry_run:
+                    cover = (book.get("cover") or "").replace("/s_", "/t7_")
+                    icon = get_icon(cover if cover.startswith("https://") else "https://www.notion.so/icons/book_gray.svg")
+                    try:
+                        page = store.request("pages", "POST", {
+                            "parent": {"type": "data_source_id", "data_source_id": data_source_id},
+                            "properties": desired, "icon": icon, "cover": icon,
+                        })
+                    except Exception:
+                        candidates = load_page_index(store).get(identifier, [])
+                        if len(candidates) != 1:
+                            raise
+                        page = candidates[0]
+                    pages_by_book[identifier] = [page]
+                    changes = property_changes(page.get("properties", {}), desired)
+            if changes:
+                totals["property_updates"] += 1
+                print(f"{'计划更新' if dry_run else '更新'}属性: {title} — {', '.join(changes)}")
+                if not dry_run:
+                    store.request(f"pages/{page['id']}", "PATCH", {"properties": changes})
+            if properties_only:
                 continue
-            metadata_only = properties_only or (pages and all(
-                get_number_property_value(page.get("properties", {}).get("Sort")) >= sort
-                for page in pages
-            ))
-            if has_any_property(("ISBN", "评分")):
-                isbn, rating = get_bookinfo(bookId)
-            else:
-                isbn, rating = "", None
-            if metadata_only:
-                properties = book_properties(
-                    title, bookId, sort, author, isbn, rating, categories
-                )
-                # Do not mark notes as synced when only refreshing metadata.
-                properties.pop("Sort", None)
-                for page in pages:
-                    client.pages.update(page_id=page["id"], properties=properties)
-                refreshed += 1
-                print(f"已刷新属性: {title}（保留笔记正文）")
+            area = find_area(store, page["id"], identifier) if page else None
+            checkpoint = area[2] if area else {}
+            cursor = notebook_cursor(item)
+            # Sort is a notebook timestamp, not a reliable change feed. Periodic
+            # audits catch edits/deletions which didn't advance the timestamp.
+            needs_notes = (full_refresh or not area or checkpoint.get("cursor") != cursor
+                           or checkpoint.get("pending")
+                           or time.time() - checkpoint.get("audited", 0) >= 7 * 86400)
+            if not needs_notes:
+                totals["skipped_notes"] += 1
                 continue
-            check(bookId)
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
-            )
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
-                bookmark_list,
-                key=lambda x: get_note_sort_key(x, chapter),
-            )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
-            synced += 1
-    print(f"同步完成：笔记同步 {synced} 本，属性刷新 {refreshed} 本，跳过 {skipped} 本")
+            records, removed = get_note_records(identifier)
+            if not dry_run:
+                area = ensure_area(store, page["id"], identifier, area)
+            stats = reconcile(store, area[0] if area else None, records, removed)
+            totals.update(stats)
+            print(f"{'预览' if dry_run else '笔记'}: {title} — {dict(stats)}")
+            if not dry_run:
+                # Atomic per-block baselines already survive partial runs. The
+                # root checkpoint is committed only after the entire book.
+                root, state = area[1], area[2]
+                state = {**state, "cursor": cursor, "audited": int(time.time()),
+                         "pending": bool(stats["conflicts"])}
+                body = clean_body(root)
+                body["rich_text"].append(marker(state))
+                if not stats["conflicts"]:
+                    sort_prop = build_notion_properties({"Sort": item.get("sort") or 0})
+                    changed_sort = property_changes(existing, sort_prop)
+                    if changed_sort:
+                        store.request(f"pages/{page['id']}", "PATCH", {"properties": changed_sort})
+                store.update(root, {"type": root["type"], root["type"]: body})
+        except UpgradeRequired:
+            raise
+        except Exception as error:
+            # No raw API responses, note text, or credentials in error logs.
+            failures.append(identifier)
+            reason = str(error) if type(error) in (RuntimeError, ValueError) else type(error).__name__
+            print(f"书籍 {identifier} 同步失败: {reason}；原页面和内容已保留，下次可续传。")
+    if book_id and not matched:
+        raise RuntimeError("指定 BookId 不在微信读书笔记本列表中")
+    print(f"{'预览完成，未写入' if dry_run else '同步完成'}: {dict(totals)}；Notion 请求: {dict(store.counts)}；失败 {len(failures)} 本")
+    if failures or totals["conflicts"]:
+        raise RuntimeError("存在失败或内容冲突，请查看日志及微信读书摘录中的新版本提示")
+    return totals
 
 
 def main(argv=None):
@@ -907,10 +1020,15 @@ def main(argv=None):
     )
     parser.add_argument("--properties-only", action="store_true",
                         help="Refresh existing book properties without changing notes.")
+    parser.add_argument("--dry-run", action="store_true", help="Preview changes without any Notion writes.")
+    parser.add_argument("--full-refresh", action="store_true", help="Audit all source notes and refresh static metadata; never delete pages.")
+    parser.add_argument("--book-id", help="Limit synchronization to one WeRead book ID.")
     args = parser.parse_args(argv)
     try:
-        sync(properties_only=args.properties_only)
-    except ConfigError:
+        sync(properties_only=args.properties_only, dry_run=args.dry_run,
+             full_refresh=args.full_refresh, book_id=args.book_id)
+    except (ConfigError, RuntimeError) as error:
+        print(str(error))
         raise SystemExit(1)
 
 

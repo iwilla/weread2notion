@@ -22,6 +22,17 @@ inputs:
     description: Refresh existing book properties without changing notes.
     required: false
     default: "false"
+  dry-run:
+    description: Preview changes without writing to Notion.
+    required: false
+    default: "false"
+  full-refresh:
+    description: Audit all notes and refresh static metadata without deleting pages.
+    required: false
+    default: "false"
+  book-id:
+    description: Limit the run to one WeRead book ID.
+    required: false
   python-version:
     description: Python version used to run the sync.
     required: false
@@ -48,9 +59,13 @@ runs:
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
         PROPERTIES_ONLY: ${{ inputs.properties-only }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        FULL_REFRESH: ${{ inputs.full-refresh }}
+        BOOK_ID: ${{ inputs.book-id }}
       run: |
-        if [[ "$PROPERTIES_ONLY" == "true" ]]; then
-          weread2notion sync --properties-only
-        else
-          weread2notion sync
-        fi
+        args=(sync)
+        if [[ "$PROPERTIES_ONLY" == "true" ]]; then args+=(--properties-only); fi
+        if [[ "$DRY_RUN" == "true" ]]; then args+=(--dry-run); fi
+        if [[ "$FULL_REFRESH" == "true" ]]; then args+=(--full-refresh); fi
+        if [[ -n "$BOOK_ID" ]]; then args+=(--book-id "$BOOK_ID"); fi
+        weread2notion "${args[@]}"

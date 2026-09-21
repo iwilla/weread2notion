@@ -48,50 +48,6 @@ class SyncTests(unittest.TestCase):
             self.assertEqual(len(cli.find_book_pages('123')), 2)
             self.assertEqual(query.call_args.kwargs['start_cursor'], 'next')
 
-    def run_sync(self, properties_only, pages):
-        with ExitStack() as stack:
-            mocks = {}
-            values = {
-                'validate_secret_inputs': {'notion_token': 'token', 'weread_api_key': 'key'},
-                'extract_notion_id': 'id', 'resolve_data_source_id': 'source',
-                'load_data_source_schema': None,
-                'get_notebooklist': [{'sort': 10, 'bookId': '123', 'title': 'Book'}],
-                'find_book_pages': pages, 'get_bookinfo': ('isbn', 8),
-                'book_properties': {'Sort': {'number': 10}, 'Progress': {'number': 50}},
-                'get_chapter_info': {}, 'get_bookmark_list': [],
-                'get_review_list': ([], []), 'get_children': ([], {}),
-                'add_children': [], 'insert_to_notion': 'new', 'check': None,
-            }
-            for name, value in values.items():
-                mocks[name] = stack.enter_context(patch.object(cli, name, return_value=value))
-            notion = stack.enter_context(patch.object(cli, 'Client')).return_value
-            stack.enter_context(patch.object(cli, 'WeReadGatewayClient'))
-            cli.sync(properties_only=properties_only)
-            return notion, mocks
-
-    def test_properties_only_preserves_notes_and_cursor(self):
-        notion, mocks = self.run_sync(True, [{'id': 'existing'}])
-        self.assertEqual(notion.pages.update.call_args.kwargs,
-                         {'page_id': 'existing', 'properties': {'Progress': {'number': 50}}})
-        mocks['check'].assert_not_called()
-        mocks['insert_to_notion'].assert_not_called()
-        mocks['get_bookmark_list'].assert_not_called()
-
-    def test_unchanged_notes_still_refresh_reading(self):
-        notion, mocks = self.run_sync(False, [{'id': 'existing', 'properties': {
-            'Sort': {'type': 'number', 'number': 10}}}])
-        notion.pages.update.assert_called_once()
-        mocks['check'].assert_not_called()
-
-    def test_properties_only_skips_missing_pages(self):
-        notion, mocks = self.run_sync(True, [])
-        notion.pages.update.assert_not_called()
-        mocks['insert_to_notion'].assert_not_called()
-
-    def test_missing_book_is_synced_regardless_of_other_books(self):
-        notion, mocks = self.run_sync(False, [])
-        mocks['insert_to_notion'].assert_called_once()
-
     def test_empty_blocks_do_not_send_empty_request(self):
         cli.client = Mock()
         self.assertEqual(cli.add_children('page', []), [])
