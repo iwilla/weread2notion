@@ -2,8 +2,17 @@ name: weread sync
 
 on:
   workflow_dispatch:
+    inputs:
+      properties-only:
+        description: "只补齐书籍属性，保留笔记正文"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 0 * * *"
+
+concurrency:
+  group: weread-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -15,6 +24,7 @@ jobs:
       - name: WeRead to Notion
         uses: ./
         with:
+          properties-only: ${{ inputs.properties-only || false }}
           weread-api-key: ${{ secrets.WEREAD_API_KEY }}
           notion-token: ${{ secrets.NOTION_TOKEN }}
           notion-page: ${{ secrets.NOTION_PAGE }}

@@ -5,7 +5,7 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -28,6 +28,7 @@ from .blocks import (
 client = None
 data_source_id = None
 data_source_property_types = {}
+data_source_property_configs = {}
 title_property_name = None
 skipped_property_names = set()
 weread = None
@@ -49,6 +50,19 @@ NOTION_ID_IN_TEXT_PATTERN = re.compile(
     r"([a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
     re.IGNORECASE,
 )
+
+
+PROPERTY_ALIASES = {
+    "作者": "Author", "分类": "Categories", "评分": "Rating",
+    "链接": "URL", "阅读时长": "ReadingTime", "阅读进度": "Progress",
+    "状态": "Status", "时间": "Date",
+}
+
+
+def resolve_property_name(name):
+    if name in data_source_property_types:
+        return name
+    return PROPERTY_ALIASES.get(name, name)
 
 
 class ConfigError(Exception):
@@ -206,7 +220,7 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        "readingTime": to_number(book.get("recordReadingTime")),
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
     }
@@ -286,11 +300,7 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
-    if not cover or not cover.startswith("http"):
-        cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
@@ -309,26 +319,32 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
     )
     if read_info != None:
         markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
+        readingTime = read_info.get("readingTime")
         readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
+        if readingTime is not None:
+            minutes = max(0, int(readingTime)) // 60
+            hours, minutes = divmod(minutes, 60)
+            raw_properties["阅读时长"] = (
+                f"{hours}时{minutes}分" if hours else f"{minutes}分"
             )
+        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
+        raw_properties["阅读进度"] = readingProgress
+        if read_info.get("finishedDate"):
+            raw_properties["时间"] = datetime.fromtimestamp(
+                read_info["finishedDate"], timezone.utc
+            ).isoformat()
 
-    properties = build_notion_properties(raw_properties)
+    return build_notion_properties(raw_properties)
+
+
+def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
+    """插入到notion"""
+    if not cover or not cover.startswith("http"):
+        cover = "https://www.notion.so/icons/book_gray.svg"
+    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+    properties = book_properties(
+        bookName, bookId, sort, author, isbn, rating, categories
+    )
     icon = get_icon(cover)
     # notion api 限制100个block
     response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
@@ -338,10 +354,10 @@ def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, catego
 
 def add_children(id, children):
     results = []
-    for i in range(0, len(children) // 100 + 1):
+    for i in range(0, len(children), 100):
         time.sleep(0.3)
         response = client.blocks.children.append(
-            block_id=id, children=children[i * 100 : (i + 1) * 100]
+            block_id=id, children=children[i : i + 100]
         )
         results.extend(response.get("results"))
     return results if len(results) == len(children) else None
@@ -587,9 +603,10 @@ def query_data_source(**body):
 
 def load_data_source_schema():
     """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
-    global data_source_property_types, title_property_name, skipped_property_names
+    global data_source_property_types, data_source_property_configs, title_property_name, skipped_property_names
     response = client.request(path=f"data_sources/{data_source_id}", method="GET")
     properties = response.get("properties") or {}
+    data_source_property_configs = properties
     data_source_property_types = {
         name: (config or {}).get("type") for name, config in properties.items()
     }
@@ -621,11 +638,11 @@ def load_data_source_schema():
 
 
 def get_property_type(name):
-    return data_source_property_types.get(name)
+    return data_source_property_types.get(resolve_property_name(name))
 
 
 def has_any_property(names):
-    return any(name in data_source_property_types for name in names)
+    return any(get_property_type(name) for name in names)
 
 
 def build_equals_filter(name, value):
@@ -726,7 +743,7 @@ def build_notion_property(name, value):
     if prop_type in {"multi_select", "status", "select"}:
         return build_option_property(prop_type, value)
     if prop_type == "date":
-        return get_date(normalize_date_value(value))
+        return {"date": {"start": normalize_date_value(value)}}
     if prop_type == "checkbox":
         return {"checkbox": bool(value)}
 
@@ -737,11 +754,30 @@ def build_notion_property(name, value):
 
 
 def build_notion_properties(raw_properties):
-    return {
-        name: prop
-        for name, value in raw_properties.items()
-        if (prop := build_notion_property(name, value)) is not None
-    }
+    result = {}
+    for logical_name, value in raw_properties.items():
+        name = resolve_property_name(logical_name)
+        config = data_source_property_configs.get(name, {})
+        number_format = config.get("number", {}).get("format")
+        if logical_name == "阅读进度" and name == "Progress" and number_format != "percent":
+            value = value * 100 if value is not None else None
+        if logical_name == "评分" and number_format == "percent":
+            value = value / 10 if value is not None else None
+        prop = build_notion_property(name, value)
+        if prop is not None:
+            result[name] = prop
+    return result
+
+
+def find_book_pages(book_id):
+    pages = []
+    body = {"filter": build_equals_filter("BookId", book_id)}
+    while True:
+        response = query_data_source(**body)
+        pages.extend(response.get("results", []))
+        if not response.get("has_more"):
+            return pages
+        body["start_cursor"] = response["next_cursor"]
 
 
 def get_number_property_value(property_value):
@@ -781,7 +817,7 @@ def resolve_data_source_id(notion_id):
     return sources[0]["id"]
 
 
-def sync():
+def sync(properties_only=False):
     global client, data_source_id, weread
     secrets = validate_secret_inputs()
     notion_id = extract_notion_id()
@@ -796,13 +832,13 @@ def sync():
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
-    latest_sort = get_sort()
+    refreshed = 0
+    synced = 0
+    skipped = 0
     books = get_notebooklist()
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
-            if sort <= latest_sort:
-                continue
             book = book.get("book") or book
             title = book.get("title") or ""
             cover = (book.get("cover") or "").replace("/s_", "/t7_")
@@ -814,11 +850,30 @@ def sync():
             if categories != None:
                 categories = [x["title"] for x in categories]
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
+            pages = find_book_pages(bookId)
+            if properties_only and not pages:
+                skipped += 1
+                continue
+            metadata_only = properties_only or (pages and all(
+                get_number_property_value(page.get("properties", {}).get("Sort")) >= sort
+                for page in pages
+            ))
             if has_any_property(("ISBN", "评分")):
                 isbn, rating = get_bookinfo(bookId)
             else:
                 isbn, rating = "", None
+            if metadata_only:
+                properties = book_properties(
+                    title, bookId, sort, author, isbn, rating, categories
+                )
+                # Do not mark notes as synced when only refreshing metadata.
+                properties.pop("Sort", None)
+                for page in pages:
+                    client.pages.update(page_id=page["id"], properties=properties)
+                refreshed += 1
+                print(f"已刷新属性: {title}（保留笔记正文）")
+                continue
+            check(bookId)
             id = insert_to_notion(
                 title, bookId, cover, sort, author, isbn, rating, categories
             )
@@ -834,6 +889,8 @@ def sync():
             results = add_children(id, children)
             if len(grandchild) > 0 and results != None:
                 add_grandchild(grandchild, results)
+            synced += 1
+    print(f"同步完成：笔记同步 {synced} 本，属性刷新 {refreshed} 本，跳过 {skipped} 本")
 
 
 def main(argv=None):
@@ -848,9 +905,11 @@ def main(argv=None):
         choices=["sync"],
         help="Command to run. Defaults to sync.",
     )
-    parser.parse_args(argv)
+    parser.add_argument("--properties-only", action="store_true",
+                        help="Refresh existing book properties without changing notes.")
+    args = parser.parse_args(argv)
     try:
-        sync()
+        sync(properties_only=args.properties_only)
     except ConfigError:
         raise SystemExit(1)
 
