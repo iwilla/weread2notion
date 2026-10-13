@@ -225,18 +225,22 @@ def get_read_info(bookId):
               "保留已有阅读属性，继续同步笔记。")
         return None
     progress = to_number(book["progress"])
-    reading_time = to_number(book.get("recordReadingTime"))
+    # Actual gateway responses expose cumulative reading seconds as readingTime.
+    # Cross-checked against /readdata/detail overall readLongest[].readTime.
+    # Keep the documented field only for responses without readingTime.
+    time_field = "readingTime" if "readingTime" in book else "recordReadingTime"
+    reading_time = to_number(book.get(time_field))
     if reading_time is None or reading_time <= 0:
-        if "recordReadingTime" not in book:
+        if time_field not in book:
             reason = "字段缺失"
-        elif book["recordReadingTime"] is None:
+        elif book[time_field] is None:
             reason = "字段为 null"
         elif reading_time is None:
             reason = "字段不是有效数值"
         else:
             reason = f"返回 {reading_time} 秒"
         print(f"书籍 {bookId} 阅读时长诊断：/book/getprogress 的 "
-              f"book.recordReadingTime {reason}；保留 Notion 已有时长。")
+              f"book.{time_field} {reason}；保留 Notion 已有时长。")
     reading_progress = normalize_reading_progress(progress)
     finish_time = book.get("finishTime") or 0
     update_time = book.get("updateTime") or 0

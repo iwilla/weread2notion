@@ -103,6 +103,28 @@ class SyncTests(unittest.TestCase):
                 self.assertEqual(props['ReadingTime']['rich_text'][0]['text']['content'], '2时30分')
                 self.assertEqual(props['Progress']['number'], 50)
 
+    def test_actual_gateway_reading_time_takes_precedence(self):
+        gateway = Mock()
+        for seconds, expected in ((3925, '1时5分'), (4878, '1时21分'),
+                                  (97425, '27时3分'), ('3925', '1时5分')):
+            with self.subTest(seconds=seconds):
+                gateway.request.return_value = {'book': {
+                    'progress': 90, 'readingTime': seconds, 'recordReadingTime': 0,
+                }}
+                with patch.object(cli, 'weread', gateway):
+                    props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+                self.assertEqual(props['ReadingTime']['rich_text'][0]['text']['content'], expected)
+
+    def test_primary_reading_time_zero_does_not_use_other_time_category(self):
+        gateway = Mock()
+        gateway.request.return_value = {'book': {
+            'progress': 50, 'readingTime': 0, 'recordReadingTime': 9000,
+        }}
+        with patch.object(cli, 'weread', gateway), patch('builtins.print') as output:
+            props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+        self.assertNotIn('ReadingTime', props)
+        self.assertIn('book.readingTime 返回 0 秒', str(output.call_args_list))
+
     def test_reading_time_diagnostics_distinguish_missing_and_zero(self):
         gateway = Mock()
         cases = (({}, '字段缺失'), ({'recordReadingTime': None}, '字段为 null'),
