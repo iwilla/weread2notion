@@ -306,8 +306,8 @@ class BoundaryTests(unittest.TestCase):
     def test_missing_reading_response_cannot_erase_properties(self):
         gateway = Mock()
         gateway.request.return_value = {}
-        with patch.object(cli, 'weread', gateway), self.assertRaises(RuntimeError):
-            cli.get_read_info('123')
+        with patch.object(cli, 'weread', gateway):
+            self.assertIsNone(cli.get_read_info('123'))
 
     def test_upgrade_required_is_not_retried(self):
         gateway = cli.WeReadGatewayClient('test-key')

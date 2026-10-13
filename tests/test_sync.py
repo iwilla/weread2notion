@@ -53,6 +53,34 @@ class SyncTests(unittest.TestCase):
             props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
         self.assertNotIn('ReadingTime', props)
 
+    def test_incomplete_progress_preserves_reading_properties(self):
+        gateway = Mock()
+        for response in ({}, {'book': None}, {'book': {}},
+                         {'book': {'progress': 'invalid', 'finishTime': 123}}):
+            with self.subTest(response=response):
+                gateway.request.return_value = response
+                with patch.object(cli, 'weread', gateway):
+                    props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+                for name in ('ReadingTime', 'Progress', 'Status', 'Date'):
+                    self.assertNotIn(name, props)
+                self.assertIn('BookName', props)
+
+    def test_zero_progress_is_valid(self):
+        gateway = Mock()
+        gateway.request.return_value = {'book': {'progress': 0, 'recordReadingTime': 0}}
+        with patch.object(cli, 'weread', gateway):
+            info = cli.get_read_info('123')
+        self.assertEqual(info['readingProgress'], 0)
+        self.assertEqual(info['readingTime'], 0)
+
+    def test_reading_request_errors_still_fail(self):
+        gateway = Mock()
+        for error in (RuntimeError('request failed'), cli.UpgradeRequired('upgrade')):
+            with self.subTest(error=error):
+                gateway.request.side_effect = error
+                with patch.object(cli, 'weread', gateway), self.assertRaises(type(error)):
+                    cli.book_properties('Book', '123', 10, 'A', None, None, None)
+
     def test_pagination(self):
         with patch.object(cli, 'query_data_source', side_effect=[
             {'results': [{'id': 'a'}], 'has_more': True, 'next_cursor': 'next'},

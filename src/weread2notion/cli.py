@@ -221,7 +221,9 @@ def get_read_info(bookId):
     data = weread.request("/book/getprogress", bookId=bookId)
     book = data.get("book")
     if not isinstance(book, dict) or to_number(book.get("progress")) is None:
-        raise RuntimeError("微信读书阅读进度响应不完整，保留已有阅读信息")
+        print(f"书籍 {bookId} 阅读信息暂不可用：响应缺少有效进度；"
+              "保留已有阅读属性，继续同步笔记。")
+        return None
     progress = to_number(book["progress"])
     reading_progress = normalize_reading_progress(progress)
     finish_time = book.get("finishTime") or 0
