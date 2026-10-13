@@ -18,6 +18,9 @@ inputs:
   notion-data-source-id:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
+  notion-reading-stats-data-source-id:
+    description: Optional daily reading statistics data source ID.
+    required: false
   properties-only:
     description: Refresh existing book properties without changing notes.
     required: false
@@ -58,6 +61,7 @@ runs:
         NOTION_PAGE: ${{ inputs.notion-page }}
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
+        NOTION_READING_STATS_DATA_SOURCE_ID: ${{ inputs.notion-reading-stats-data-source-id }}
         PROPERTIES_ONLY: ${{ inputs.properties-only }}
         DRY_RUN: ${{ inputs.dry-run }}
         FULL_REFRESH: ${{ inputs.full-refresh }}

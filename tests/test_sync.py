@@ -125,6 +125,40 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn('ReadingTime', props)
         self.assertIn('book.readingTime 返回 0 秒', str(output.call_args_list))
 
+    def test_extended_book_fields_and_long_intro(self):
+        cli.data_source_property_types.update({
+            'ReadingMinutes': 'number', 'LastRead': 'date', 'StartedReading': 'date',
+            'BookmarkCount': 'number', 'ReviewCount': 'number', 'NoteCount': 'number',
+            'Translator': 'rich_text', 'Publisher': 'rich_text', 'PublishedDate': 'date',
+            'Intro': 'rich_text', 'WordCount': 'number', 'RatingCount': 'number',
+        })
+        gateway = Mock()
+        gateway.request.return_value = {'book': {'progress': 50, 'readingTime': 3925,
+                                                'updateTime': 1791388800, 'startReadingTime': 1791302400}}
+        with patch.object(cli, 'weread', gateway):
+            props = cli.book_properties('Book', '123', 10, 'A', None, None, None,
+                details={'translator': 'T', 'publisher': '', 'publishTime': '2026-03-09 00:00:00',
+                         'intro': 'x' * 4100, 'newRatingCount': 584},
+                notebook={'bookmarkCount': 0, 'reviewCount': 3})
+        self.assertEqual(props['ReadingMinutes']['number'], 65.42)
+        self.assertEqual(props['PublishedDate']['date']['start'], '2026-03-09')
+        self.assertEqual(props['RatingCount']['number'], 584)
+        self.assertEqual(props['BookmarkCount']['number'], 0)
+        self.assertNotIn('Publisher', props)
+        self.assertNotIn('WordCount', props)
+        self.assertNotIn('NoteCount', props)
+        self.assertIn('LastRead', props)
+        self.assertIn('StartedReading', props)
+        self.assertEqual([len(x['text']['content']) for x in props['Intro']['rich_text']], [2000, 2000, 100])
+
+    def test_invalid_publication_date_preserves_existing_date(self):
+        self.assertNotIn('出版日期', cli.detail_properties({'publishTime': 'unknown'}))
+
+    def test_gateway_rating_925_maps_to_9_point_25(self):
+        cli.data_source_property_configs = {'Rating': {'number': {'format': 'percent'}}}
+        props = cli.build_notion_properties({'评分': cli.normalize_rating(925)})
+        self.assertEqual(props['Rating']['number'], .925)
+
     def test_reading_time_diagnostics_distinguish_missing_and_zero(self):
         gateway = Mock()
         cases = (({}, '字段缺失'), ({'recordReadingTime': None}, '字段为 null'),

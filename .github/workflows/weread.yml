@@ -45,3 +45,4 @@ jobs:
           notion-page: ${{ secrets.NOTION_PAGE }}
           notion-database-id: ${{ secrets.NOTION_DATABASE_ID }}
           notion-data-source-id: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          notion-reading-stats-data-source-id: ${{ vars.NOTION_READING_STATS_DATA_SOURCE_ID || '9dcccd81-8eba-428d-80b4-bf6e9909dff1' }}

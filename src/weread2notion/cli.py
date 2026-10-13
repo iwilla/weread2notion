@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
 from .incremental import (
     NotionStore, source_records, find_area, ensure_area, reconcile,
-    clean_body, marker, property_changes, property_value,
+    clean_body, marker, property_changes, property_value, rich_text,
 )
 from collections import Counter
 from .blocks import (
@@ -60,7 +60,12 @@ PROPERTY_ALIASES = {
     "作者": "Author", "分类": "Categories", "评分": "Rating",
     "链接": "URL", "阅读时长": "ReadingTime", "阅读进度": "Progress",
     "状态": "Status", "时间": "Date",
+    "阅读分钟": "ReadingMinutes", "最近阅读": "LastRead", "开始阅读": "StartedReading",
+    "划线数": "BookmarkCount", "想法数": "ReviewCount", "笔记数": "NoteCount",
+    "译者": "Translator", "出版社": "Publisher", "出版日期": "PublishedDate",
+    "简介": "Intro", "字数": "WordCount", "评分人数": "RatingCount",
 }
+DETAIL_PROPERTIES = ("译者", "出版社", "出版日期", "简介", "字数", "评分人数")
 
 
 def resolve_property_name(name):
@@ -255,6 +260,8 @@ def get_read_info(bookId):
         "readingTime": reading_time,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
+        "lastRead": update_time,
+        "startedReading": book.get("startReadingTime"),
     }
 
 
@@ -267,7 +274,7 @@ def normalize_reading_progress(value):
 def normalize_rating(value):
     value = value or 0
     if value > 100:
-        return value / 1000
+        return value / 100
     if value > 10:
         return value / 10
     return value
@@ -279,6 +286,25 @@ def get_bookinfo(bookId):
     isbn = data.get("isbn")
     newRating = normalize_rating(data["newRating"]) if data.get("newRating") is not None else None
     return (isbn, newRating)
+
+
+def detail_properties(data):
+    """Map optional metadata; missing fields never erase existing values."""
+    values = {name: data.get(field) for name, field in (
+        ("译者", "translator"), ("出版社", "publisher"), ("简介", "intro"),
+        ("字数", "wordCount"), ("评分人数", "newRatingCount"),
+    )}
+    published = data.get("publishTime")
+    if published:
+        try:
+            if isinstance(published, (int, float)):
+                published = datetime.fromtimestamp(published, timezone.utc).date().isoformat()
+            else:
+                published = datetime.fromisoformat(str(published).replace("Z", "+00:00")).date().isoformat()
+            values["出版日期"] = published
+        except (ValueError, TypeError, OverflowError, OSError):
+            pass
+    return {name: value for name, value in values.items() if value is not None and value != ""}
 
 
 def get_review_list(bookId):
@@ -317,7 +343,7 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
+def book_properties(bookName, bookId, sort, author, isbn, rating, categories, details=None, notebook=None):
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
@@ -329,9 +355,14 @@ def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
     }
     if categories != None:
         raw_properties["分类"] = categories
+    raw_properties.update(detail_properties(details or {}))
+    for name, field in (("划线数", "bookmarkCount"), ("想法数", "reviewCount"), ("笔记数", "noteCount")):
+        count = to_number((notebook or {}).get(field))
+        if count is not None and count >= 0:
+            raw_properties[name] = count
     read_info = (
         get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
+        if has_any_property(("状态", "阅读时长", "阅读进度", "时间", "阅读分钟", "最近阅读", "开始阅读"))
         else None
     )
     if read_info != None:
@@ -346,6 +377,11 @@ def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
                 f"{hours}时{minutes}分" if hours else
                 (f"{minutes}分" if minutes else f"{max(1, seconds)}秒")
             )
+            raw_properties["阅读分钟"] = round(readingTime / 60, 2)
+        for name, field in (("最近阅读", "lastRead"), ("开始阅读", "startedReading")):
+            timestamp = to_number(read_info.get(field))
+            if timestamp is not None and timestamp > 0:
+                raw_properties[name] = datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读进度"] = readingProgress
         if read_info.get("finishedDate"):
@@ -777,7 +813,7 @@ def build_notion_property(name, value):
     if prop_type == "title":
         return get_title(to_text(value))
     if prop_type == "rich_text":
-        return get_rich_text(to_text(value))
+        return {"rich_text": rich_text(to_text(value))}
     if prop_type == "number":
         number = to_number(value)
         return get_number(number) if number is not None else None
@@ -953,13 +989,23 @@ def sync(properties_only=False, dry_run=False, full_refresh=False, book_id=None)
                 get_property_type(name) and property_value(existing.get(resolve_property_name(name), {})) in (None, "")
                 for name in ("ISBN", "评分")
             )
-            isbn, rating = (get_bookinfo(identifier) if (missing_details or full_refresh)
-                            and has_any_property(("ISBN", "评分")) else (None, None))
+            extended_missing = any(
+                get_property_type(name) and property_value(existing.get(resolve_property_name(name), {})) in (None, "")
+                for name in DETAIL_PROPERTIES
+            )
+            details = None
+            if has_any_property(DETAIL_PROPERTIES) and (extended_missing or missing_details or full_refresh):
+                details = weread.request("/book/info", bookId=identifier)
+                isbn = details.get("isbn") or None
+                rating = normalize_rating(details["newRating"]) if details.get("newRating") is not None else None
+            else:
+                isbn, rating = (get_bookinfo(identifier) if (missing_details or full_refresh)
+                                and has_any_property(("ISBN", "评分")) else (None, None))
             categories = book.get("categories")
             if categories is not None:
                 categories = [x["title"] for x in categories]
             desired = book_properties(title, identifier, item.get("sort") or 0,
-                                      book.get("author"), isbn, rating, categories)
+                                      book.get("author"), isbn, rating, categories, details=details, notebook=item)
             desired.pop("Sort", None)
             changes = property_changes(existing, desired)
             if not page:
@@ -1026,6 +1072,19 @@ def sync(properties_only=False, dry_run=False, full_refresh=False, book_id=None)
             print(f"书籍 {identifier} 同步失败: {reason}；原页面和内容已保留，下次可续传。")
     if book_id and not matched:
         raise RuntimeError("指定 BookId 不在微信读书笔记本列表中")
+    stats_source = os.getenv("NOTION_READING_STATS_DATA_SOURCE_ID", "").strip()
+    if stats_source and not book_id:
+        from .reading_stats import sync_daily_reading
+        if not NOTION_ID_PATTERN.fullmatch(stats_source):
+            raise RuntimeError("NOTION_READING_STATS_DATA_SOURCE_ID 格式不正确")
+        try:
+            totals.update(sync_daily_reading(weread, store, stats_source))
+        except UpgradeRequired:
+            raise
+        except Exception as error:
+            failures.append("reading_stats")
+            reason = str(error) if type(error) in (RuntimeError, ValueError) else type(error).__name__
+            print(f"每日阅读统计同步失败: {reason}")
     print(f"{'预览完成，未写入' if dry_run else '同步完成'}: {dict(totals)}；Notion 请求: {dict(store.counts)}；失败 {len(failures)} 本")
     if failures or totals["conflicts"]:
         raise RuntimeError("存在失败或内容冲突，请查看日志及微信读书摘录中的新版本提示")
