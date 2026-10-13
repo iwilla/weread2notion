@@ -90,6 +90,34 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(info['readingProgress'], 0)
         self.assertEqual(info['readingTime'], 0)
 
+    def test_official_progress_response_to_notion_reading_time(self):
+        gateway = Mock()
+        for seconds in (9000, '9000'):
+            with self.subTest(seconds=seconds):
+                gateway.request.return_value = {'bookId': '123', 'book': {
+                    'progress': 50, 'recordReadingTime': seconds,
+                }}
+                with patch.object(cli, 'weread', gateway):
+                    props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+                gateway.request.assert_called_with('/book/getprogress', bookId='123')
+                self.assertEqual(props['ReadingTime']['rich_text'][0]['text']['content'], '2时30分')
+                self.assertEqual(props['Progress']['number'], 50)
+
+    def test_reading_time_diagnostics_distinguish_missing_and_zero(self):
+        gateway = Mock()
+        cases = (({}, '字段缺失'), ({'recordReadingTime': None}, '字段为 null'),
+                 ({'recordReadingTime': 'invalid'}, '字段不是有效数值'),
+                 ({'recordReadingTime': 0}, '返回 0 秒'))
+        for fields, reason in cases:
+            with self.subTest(fields=fields):
+                gateway.request.return_value = {'book': {'progress': 50, **fields}}
+                with patch.object(cli, 'weread', gateway), patch('builtins.print') as output:
+                    props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+                self.assertNotIn('ReadingTime', props)
+                messages = ' '.join(str(call.args[0]) for call in output.call_args_list)
+                self.assertIn('book.recordReadingTime', messages)
+                self.assertIn(reason, messages)
+
     def test_reading_request_errors_still_fail(self):
         gateway = Mock()
         for error in (RuntimeError('request failed'), cli.UpgradeRequired('upgrade')):

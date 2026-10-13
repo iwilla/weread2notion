@@ -225,6 +225,18 @@ def get_read_info(bookId):
               "保留已有阅读属性，继续同步笔记。")
         return None
     progress = to_number(book["progress"])
+    reading_time = to_number(book.get("recordReadingTime"))
+    if reading_time is None or reading_time <= 0:
+        if "recordReadingTime" not in book:
+            reason = "字段缺失"
+        elif book["recordReadingTime"] is None:
+            reason = "字段为 null"
+        elif reading_time is None:
+            reason = "字段不是有效数值"
+        else:
+            reason = f"返回 {reading_time} 秒"
+        print(f"书籍 {bookId} 阅读时长诊断：/book/getprogress 的 "
+              f"book.recordReadingTime {reason}；保留 Notion 已有时长。")
     reading_progress = normalize_reading_progress(progress)
     finish_time = book.get("finishTime") or 0
     update_time = book.get("updateTime") or 0
@@ -236,7 +248,7 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": to_number(book.get("recordReadingTime")),
+        "readingTime": reading_time,
         "readingProgress": reading_progress,
         "finishedDate": finish_time,
     }
@@ -330,8 +342,6 @@ def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
                 f"{hours}时{minutes}分" if hours else
                 (f"{minutes}分" if minutes else f"{max(1, seconds)}秒")
             )
-        elif readingTime is not None:
-            print(f"书籍 {bookId} 阅读时长为非正值，暂不写入，保留已有时长。")
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读进度"] = readingProgress
         if read_info.get("finishedDate"):
@@ -658,6 +668,12 @@ def load_data_source_schema():
         f"已读取 Notion 属性 {len(data_source_property_types)} 个，"
         f"标题属性: {title_property_name}"
     )
+    reading_time_name = resolve_property_name("阅读时长")
+    reading_time_type = get_property_type("阅读时长")
+    print(f"阅读时长目标属性: {reading_time_name}，类型: {reading_time_type or '不存在'}")
+    if reading_time_type and reading_time_type != "rich_text":
+        print("阅读时长使用文本（如 2时30分），请将目标属性设置为文本类型；"
+              "当前类型可能无法正确写入。")
 
 
 def get_property_type(name):
