@@ -5,6 +5,19 @@ from weread2notion import cli
 
 
 class SyncTests(unittest.TestCase):
+    def test_gateway_sends_supported_skill_version(self):
+        gateway = cli.WeReadGatewayClient('test-key')
+        response = Mock()
+        response.json.return_value = {'errcode': 0, 'books': []}
+        with patch.object(gateway.session, 'post', return_value=response) as post:
+            self.assertEqual(gateway.request('/user/notebooks', count=100),
+                             {'errcode': 0, 'books': []})
+        post.assert_called_once_with(
+            cli.WEREAD_GATEWAY_URL,
+            json={'api_name': '/user/notebooks', 'skill_version': '1.0.5', 'count': 100},
+            timeout=30,
+        )
+
     def setUp(self):
         cli.data_source_property_types = {
             'BookName': 'title', 'BookId': 'rich_text', 'Sort': 'number',
