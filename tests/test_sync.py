@@ -53,6 +53,23 @@ class SyncTests(unittest.TestCase):
             props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
         self.assertNotIn('ReadingTime', props)
 
+    def test_nonpositive_reading_time_preserves_existing_value(self):
+        from weread2notion.incremental import property_changes
+        existing = {'ReadingTime': {'rich_text': [{'text': {'content': '2时30分'}}]}}
+        for seconds in (0, -1):
+            with self.subTest(seconds=seconds):
+                with patch.object(cli, 'get_read_info', return_value={
+                    'readingTime': seconds, 'readingProgress': .5,
+                }):
+                    props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+                self.assertNotIn('ReadingTime', property_changes(existing, props))
+                self.assertEqual(props['Progress']['number'], 50)
+
+    def test_subminute_reading_time_shows_seconds(self):
+        with patch.object(cli, 'get_read_info', return_value={'readingTime': 30}):
+            props = cli.book_properties('Book', '123', 10, 'A', None, None, None)
+        self.assertEqual(props['ReadingTime']['rich_text'][0]['text']['content'], '30秒')
+
     def test_incomplete_progress_preserves_reading_properties(self):
         gateway = Mock()
         for response in ({}, {'book': None}, {'book': {}},

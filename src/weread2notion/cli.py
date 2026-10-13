@@ -322,12 +322,16 @@ def book_properties(bookName, bookId, sort, author, isbn, rating, categories):
         markedStatus = read_info.get("markedStatus", 0)
         readingTime = read_info.get("readingTime")
         readingProgress = read_info.get("readingProgress", 0)
-        if readingTime is not None:
-            minutes = max(0, int(readingTime)) // 60
+        if readingTime is not None and readingTime > 0:
+            seconds = int(readingTime)
+            minutes = seconds // 60
             hours, minutes = divmod(minutes, 60)
             raw_properties["阅读时长"] = (
-                f"{hours}时{minutes}分" if hours else f"{minutes}分"
+                f"{hours}时{minutes}分" if hours else
+                (f"{minutes}分" if minutes else f"{max(1, seconds)}秒")
             )
+        elif readingTime is not None:
+            print(f"书籍 {bookId} 阅读时长为非正值，暂不写入，保留已有时长。")
         raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
         raw_properties["阅读进度"] = readingProgress
         if read_info.get("finishedDate"):
