@@ -1072,19 +1072,6 @@ def sync(properties_only=False, dry_run=False, full_refresh=False, book_id=None)
             print(f"书籍 {identifier} 同步失败: {reason}；原页面和内容已保留，下次可续传。")
     if book_id and not matched:
         raise RuntimeError("指定 BookId 不在微信读书笔记本列表中")
-    stats_source = os.getenv("NOTION_READING_STATS_DATA_SOURCE_ID", "").strip()
-    if stats_source and not book_id:
-        from .reading_stats import sync_daily_reading
-        if not NOTION_ID_PATTERN.fullmatch(stats_source):
-            raise RuntimeError("NOTION_READING_STATS_DATA_SOURCE_ID 格式不正确")
-        try:
-            totals.update(sync_daily_reading(weread, store, stats_source))
-        except UpgradeRequired:
-            raise
-        except Exception as error:
-            failures.append("reading_stats")
-            reason = str(error) if type(error) in (RuntimeError, ValueError) else type(error).__name__
-            print(f"每日阅读统计同步失败: {reason}")
     print(f"{'预览完成，未写入' if dry_run else '同步完成'}: {dict(totals)}；Notion 请求: {dict(store.counts)}；失败 {len(failures)} 本")
     if failures or totals["conflicts"]:
         raise RuntimeError("存在失败或内容冲突，请查看日志及微信读书摘录中的新版本提示")

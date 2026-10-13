@@ -81,7 +81,7 @@ weread2notion sync --full-refresh --dry-run
 
 接口依据：[腾讯微信读书官方说明](https://github.com/Tencent/WeChatReading/blob/main/skills/SKILL.md)、[笔记与划线接口](https://github.com/Tencent/WeChatReading/blob/main/skills/notes.md)、[阅读进度单位](https://github.com/Tencent/WeChatReading/blob/main/skills/book.md)。
 
-## 扩展书籍信息与每日阅读统计
+## 扩展书籍信息
 
 现有书籍数据库可以添加下列可选属性（英文旧模板和中文名称均支持）。无需改动 BookId、Sort 或现有笔记。
 
@@ -97,11 +97,7 @@ weread2notion sync --full-refresh --dry-run
 
 详情属性缺失或 `--full-refresh` 时查询 `/book/info`，已填充的详情平时不反复刷新。实际回包的评分 925 转为 9.25 分，百分比格式写入 0.925；历史评分可用全面核对刷新。
 
-每日统计使用独立数据库，需 `Name`（标题）、`Date`（日期）、`SyncKey`（文本）、`ReadingSeconds` / `ReadingMinutes`（数字）。将该数据库授权给当前 Notion integration，然后配置环境变量 `NOTION_READING_STATS_DATA_SOURCE_ID` 或 Action 输入 `notion-reading-stats-data-source-id`。未配置时不请求统计接口。当前仓库 workflow 已配置创建的统计数据源；可用 GitHub 仓库变量 `NOTION_READING_STATS_DATA_SOURCE_ID` 替换。
-
-每次同步读取本月和上月 `/readdata/detail` 的 `readTimes`，按北京时间日期幂等更新；单位是阅读/收听秒数，分钟另列保存。日期缺失不补零、不删除已有记录。`--dry-run` 同时预览统计；`--properties-only` 可更新统计；指定 `--book-id` 时只处理该书。历史更早月份目前不自动补录。可在 Notion 使用 Date 分组、ReadingMinutes 求和建立每日图表，或创建日期视图；图表权限取决于 Notion 套餐。
-
-Notion 免费版的工作区只能使用一个原生图表。同步代码不依赖图表或付费功能：可使用「每日阅读（免费版）」表格、阅读日历、最近阅读和阅读时长排行。遇到图表升级提示时切换到表格视图；无需为数据同步升级套餐。
+同步仅维护原书籍数据库及其笔记，不再创建或更新每日统计数据库和阅读中心。可直接在书籍数据库使用最近阅读、阅读时长排行等普通表格视图，无需图表功能。
 
 ## 失败恢复与边界
 
